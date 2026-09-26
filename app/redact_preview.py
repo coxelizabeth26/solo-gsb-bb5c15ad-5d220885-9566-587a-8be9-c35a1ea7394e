@@ -7,18 +7,23 @@
 的优先级贪心选出互不重叠的命中集合，仅把选中字符**逐字**替换为 "█"
 （每个字符一个 █），词序、时间与说话人保持不变。
 
-算法（候选枚举 + 按优先级单趟扫描）：
+算法（按字符起点保留优先候选 + 顺序贪心选取）：
 
 * 候选：对每个说话人连续区间、每条短语，用 str.find 枚举全部出现起点
-  （每次从 pos + 1 继续，允许重叠出现），得到候选 (起点, 长度, 短语序号)；
-* 选择：候选按 (起点升序, 长度降序, 短语输入序号升序) 排序后单趟扫描，
-  维护已选命中的右端 last_end，起点不早于 last_end 的候选即被选中——
-  排序保证任何被跳过的候选都与某个优先级更高的已选命中重叠；
+  （每次从 pos + 1 继续，允许重叠出现）；区间长度为 L 时开长度 L 的
+  best_by_start 数组，每个字符起点只保留裁决优先级最高的一条候选
+  （长度降序、短语输入序号升序），其余重叠候选即时丢弃、不入内存；
+* 选择：按起点 pos = 0..L-1 顺序扫描，某起点存在候选且起点不早于已选
+  命中右端 last_end 时即选中该候选——同起点只留最优候选，而任何被跳过
+  的起点都与某个优先级更高（起点更早）的已选命中重叠，与“先排序再
+  单趟扫描”结果完全一致；
 * 映射：命中区间 [pos, pos+len) 用二分定位首末词（run_offsets 为区间内
   各词首字符的偏移），得到首末词序号与两端词内字符偏移：首词内
   [start_char, 词末)、末词内 [0, end_char)，跨词命中覆盖中间词的全部字符；
-* 复杂度：O(P·T + H log H) 时间、O(T + H) 空间，P 为短语数（≤ 50）、
-  T 为全量拼接文本总字符数、H 为候选命中总数。
+* 复杂度：O(P·T + T) 时间、O(T) 额外工作内存，P 为短语数（≤ 50）、
+  T 为全量拼接文本总字符数（另需短语自身的 O(短语总长度)）；额外内存
+  不随重叠命中总数 H 增长——高重复文本（如长串 "a" 配短语 "a"/"aa"/…）
+  下 H 可达短语数 × 文本长度，旧实现把全部候选存表排序会随之放大内存。
 """
 
 from bisect import bisect_right
@@ -59,22 +64,26 @@ def redact_preview(words, phrases):
         for k in range(run_start, run_end - 1):
             run_offsets.append(run_offsets[-1] + char_counts[k])
 
-        # ---- 候选命中：(起点, 长度, 短语序号)；重叠出现各自成候选 ----
-        candidates = []
+        # ---- 候选：每个字符起点只保留裁决优先级最高的一条（长度降序、
+        # 短语输入序号升序）；被比掉的候选即时丢弃，不随重叠命中数放大内存 ----
+        run_len = len(run_text)
+        best_by_start = [-1] * run_len  # 起点 -> 该起点最优候选的短语序号
         for phrase_index, phrase in enumerate(phrases):
+            length = len(phrase)
             pos = run_text.find(phrase)
             while pos >= 0:
-                candidates.append((pos, len(phrase), phrase_index))
+                prev = best_by_start[pos]
+                if prev < 0 or length > len(phrases[prev]):
+                    best_by_start[pos] = phrase_index
                 pos = run_text.find(phrase, pos + 1)
-        # 起点靠前优先；同起点短语较长优先；再按短语输入顺序保证确定性
-        candidates.sort(key=lambda c: (c[0], -c[1], c[2]))
 
-        # ---- 贪心选出互不重叠的命中 ----
+        # ---- 按起点顺序贪心选出互不重叠的命中 ----
         last_end = 0
-        for pos, length, phrase_index in candidates:
-            if pos < last_end:
-                continue  # 与优先级更高的已选命中重叠
-            end = pos + length
+        for pos in range(run_len):
+            phrase_index = best_by_start[pos]
+            if phrase_index < 0 or pos < last_end:
+                continue  # 该起点无候选，或与优先级更高的已选命中重叠
+            end = pos + len(phrases[phrase_index])
             last_end = end
 
             first_ptr = bisect_right(run_offsets, pos) - 1

@@ -3,10 +3,12 @@
 朴素实现 naive_redact 与核心算法相互独立：逐起点 startswith 扫描候选、
 用被占用字符集合判定重叠、逐词行走映射命中区间，与 redact_preview 对比。
 另对随机输入做性质校验：命中互不重叠、每个落选候选都与更高优先级的
-已选命中重叠、遮罩文本与命中列表自洽。
+已选命中重叠、遮罩文本与命中列表自洽；并对高重复输入（长串同一字符 +
+多条嵌套短语）做功能与内存回归。
 """
 
 import random
+import tracemalloc
 import unittest
 from types import SimpleNamespace
 
@@ -240,6 +242,99 @@ class OverlapResolutionTests(unittest.TestCase):
         self.assertEqual(
             [(h["start_word"], h["start_char"]) for h in hits], [(0, 1), (2, 1)]
         )
+
+
+class HighRepeatRegressionTests(unittest.TestCase):
+    """高重复输入回归：长串重复字符配多条嵌套短语（"a"/"aa"/…）。
+
+    同一说话人长文本全为同一字符时，每条嵌套短语几乎在每个字符起点都有
+    命中，重叠候选数 ≈ 短语数 × 文本长度；旧实现把全部候选存入列表再排序，
+    额外内存随之相乘放大。实现必须按字符起点只保留优先候选，额外工作内存
+    随文本长度（与短语总长度）线性增长，不随全部重叠命中数增长。
+    """
+
+    def test_nested_phrases_longer_wins_at_same_start(self):
+        # "aaaaa" 配嵌套短语：起点 0 处最长的 "aaa" 优先，余下 "aa" 恰好接上
+        redacted, hits = redact_preview([W(0, 100, "aaaaa")], ["a", "aa", "aaa"])
+        self.assertEqual(redacted[0]["text"], "█████")
+        self.assertEqual(
+            [(h["phrase"], h["start_char"], h["end_char"]) for h in hits],
+            [("aaa", 0, 3), ("aa", 3, 5)],
+        )
+
+    def test_nested_phrases_tail_too_short_left_untouched(self):
+        # 尾部不足任何短语长度的字符不被遮罩
+        redacted, hits = redact_preview([W(0, 100, "aaaa")], ["aa", "aaa"])
+        self.assertEqual(redacted[0]["text"], "███a")
+        self.assertEqual([h["phrase"] for h in hits], ["aaa"])
+
+    def test_nested_phrases_cross_word_not_speaker(self):
+        # 说话人 A 连续区间内长短语可跨词命中；换说话人后从头重新匹配
+        words = [
+            W(0, 100, "aa", "A"),
+            W(100, 200, "aa", "A"),
+            W(200, 300, "ab", "B"),
+        ]
+        redacted, hits = redact_preview(words, ["a", "aaa"])
+        self.assertEqual([w["text"] for w in redacted], ["██", "██", "█b"])
+        self.assertEqual(
+            [
+                (
+                    h["phrase"],
+                    h["start_word"],
+                    h["end_word"],
+                    h["start_char"],
+                    h["end_char"],
+                )
+                for h in hits
+            ],
+            [
+                ("aaa", 0, 1, 0, 1),  # 跨词命中：覆盖词 0 全部 + 词 1 首字符
+                ("a", 1, 1, 1, 2),
+                ("a", 2, 2, 0, 1),  # 说话人 B 的区间独立匹配
+            ],
+        )
+
+    def test_high_repeat_extra_memory_bounded(self):
+        # 2000 字符全 "a"（20 词 × 100 字符）+ 50 条嵌套短语：
+        # 重叠候选约 10 万条，旧“全量候选列表 + 排序”实现同输入峰值约 20MB；
+        # 按字符起点保留优先候选后，额外工作内存应远低于 4MB（与候选数无关）。
+        words = [
+            W(i * 100, i * 100 + 100, "a" * 100, "A") for i in range(20)
+        ]
+        phrases = ["a" * k for k in range(1, 51)]
+
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            redacted, hits = redact_preview(words, phrases)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        # 最长短语（50 字符）铺满：2000 / 50 = 40 条命中，全部字符被遮罩
+        self.assertEqual(len(hits), 40)
+        self.assertTrue(all(h["phrase"] == phrases[-1] for h in hits))
+        self.assertEqual(
+            (
+                hits[0]["start_word"],
+                hits[0]["end_word"],
+                hits[0]["start_char"],
+                hits[0]["end_char"],
+            ),
+            (0, 0, 0, 50),
+        )
+        self.assertEqual(
+            (
+                hits[-1]["start_word"],
+                hits[-1]["end_word"],
+                hits[-1]["start_char"],
+                hits[-1]["end_char"],
+            ),
+            (19, 19, 50, 100),
+        )
+        self.assertTrue(all(w["text"] == REDACT_CHAR * 100 for w in redacted))
+        self.assertLess(peak, 4 * 1024 * 1024)
 
 
 class ValidationReuseTests(unittest.TestCase):
