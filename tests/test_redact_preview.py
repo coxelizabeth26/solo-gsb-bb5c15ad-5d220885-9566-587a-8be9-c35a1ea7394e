@@ -7,6 +7,7 @@
 """
 
 import random
+import tracemalloc
 import unittest
 from types import SimpleNamespace
 
@@ -262,6 +263,64 @@ class ValidationReuseTests(unittest.TestCase):
         with self.assertRaises(DomainError) as ctx:
             redact_preview([W(2000, 1000, "甲")], ["甲"])
         self.assertEqual(ctx.exception.code, "invalid_time_range")
+
+
+class HighRepetitionTests(unittest.TestCase):
+    """高重复输入回归：连续 "a" 长文本 + 嵌套短语（"a"、"aa"、…、"aa…a"）。
+
+    旧实现把全部重叠候选（约 P·T 条，P 为短语数、T 为文本长度）存入列表再
+    排序，额外内存随候选命中总数膨胀，可能耗尽内存；现实现只为每个字符起点
+    保留一条优先候选，额外内存随文本长度与短语总长度增长。
+    """
+
+    def test_nested_phrases_on_long_repetitive_text(self):
+        # 1000 个 "a"，短语 "a"/"aa"/"aaa"：每个起点的优先候选是能放下的最长者，
+        # 贪心依次选中 [0,3) [3,6) … [996,999)，末尾只剩 1 字符时退为 "a"
+        redacted, hits = redact_preview([W(0, 1000, "a" * 1000)], ["a", "aa", "aaa"])
+        self.assertEqual(redacted[0]["text"], REDACT_CHAR * 1000)
+        self.assertEqual(len(hits), 334)  # 1000 = 333×3 + 1
+        self.assertEqual([h["index"] for h in hits], list(range(334)))
+        for i, h in enumerate(hits[:-1]):
+            self.assertEqual(h["phrase"], "aaa")
+            self.assertEqual(
+                (h["start_word"], h["end_word"], h["start_char"], h["end_char"]),
+                (0, 0, 3 * i, 3 * i + 3),
+            )
+        self.assertEqual(hits[-1]["phrase"], "a")
+        self.assertEqual((hits[-1]["start_char"], hits[-1]["end_char"]), (999, 1000))
+
+    def test_repetitive_across_words_and_speakers_matches_naive(self):
+        # 高重复文本跨词、跨说话人，与独立朴素实现对拍
+        words = [
+            W(0, 100, "a" * 40, "A"),
+            W(100, 200, "a" * 40, "A"),
+            W(200, 300, "a" * 40, "B"),
+            W(300, 400, "b" * 20 + "a" * 20, "B"),
+        ]
+        phrases = ["a" * k for k in range(1, 9)] + ["ba", "aab"]
+        self.assertEqual(redact_preview(words, phrases), naive_redact(words, phrases))
+
+    def test_memory_grows_with_text_not_hit_count(self):
+        # 回归：本例重叠候选约 P·T = 30 万条，旧实现全部入列表排序，
+        # 峰值内存逾 60MB 且随 P·T 继续膨胀；现实现每个起点只留一条优先候选
+        t_chars, n_phrases = 10_000, 30
+        words = [W(0, t_chars, "a" * t_chars)]
+        phrases = ["a" * k for k in range(1, n_phrases + 1)]
+        tracemalloc.start()
+        try:
+            redacted, hits = redact_preview(words, phrases)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        # 结果本身正确：全文遮罩，每 30 字符一条 "aa…a"（30 个 a）命中，
+        # 末尾不足 30 字符的余数退为能放下的最长命中
+        self.assertEqual(redacted[0]["text"], REDACT_CHAR * t_chars)
+        self.assertEqual(len(hits), 334)  # 10000 = 333×30 + 10
+        self.assertEqual([h["phrase"] for h in hits[:-1]], [phrases[-1]] * 333)
+        self.assertEqual(hits[-1]["phrase"], "a" * 10)
+        # 额外工作内存不随候选命中总数增长：上限取 32MB，
+        # 旧实现（>60MB）必然越界，现实现实测约 2MB
+        self.assertLess(peak, 32 * 1024 * 1024)
 
 
 class DifferentialTests(unittest.TestCase):
